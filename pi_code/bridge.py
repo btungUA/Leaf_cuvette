@@ -19,13 +19,12 @@ def on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload.decode())
         
-        # Dynamically extract all numeric data from the JSON
+        # Dynamically extract all numeric data from the JSON (temp, humidity, mosfet, etc.)
         fields = {}
         for key, value in payload.items():
             if isinstance(value, (int, float)) and key != "sensor":
                 fields[key] = float(value)
         
-        # Format for InfluxDB
         json_body = [
             {
                 "measurement": "leaf_sensors", 
@@ -43,7 +42,6 @@ def on_message(client, userdata, msg):
     except Exception as e:
         print(f"Error processing message: {e}")
 
-# Start Listener
 client = mqtt.Client()
 client.on_connect = on_connect
 client.on_message = on_message

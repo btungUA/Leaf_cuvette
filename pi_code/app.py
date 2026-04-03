@@ -1,5 +1,4 @@
 import streamlit as st
-import paho.mqtt.client as mqtt
 from influxdb import InfluxDBClient
 import pandas as pd
 import time
@@ -7,22 +6,12 @@ import plotly.express as px
 import numpy as np
 
 # --- CONFIGURATION ---
-MQTT_BROKER = "localhost"
 INFLUX_DB = "sensor_data"
-REFRESH_RATE = 1 
+REFRESH_RATE = 2 
 
 st.set_page_config(page_title="Leaf Cuvette Dashboard", layout="wide")
 
 # --- SETUP CONNECTIONS ---
-if 'mqtt_client' not in st.session_state:
-    try:
-        client = mqtt.Client()
-        client.connect(MQTT_BROKER, 1883, 60)
-        client.loop_start()
-        st.session_state.mqtt_client = client
-    except:
-        st.session_state.mqtt_client = None
-
 if 'influx_client' not in st.session_state:
     try:
         client = InfluxDBClient(host='localhost', port=8086, database=INFLUX_DB)
@@ -69,7 +58,6 @@ def go_to_home(): st.session_state.page = 'dashboard'
 def render_dashboard():
     st.title("🌱 Leaf Cuvette Dashboard")
 
-    # ROW 1: GRAPHS (Fake data for Li-7810 placeholders)
     col_co2, col_ch4, col_h2o = st.columns(3)
     with col_co2:
         st.markdown("### ☁️ CO2 (ppm)")
@@ -90,55 +78,31 @@ def render_dashboard():
         st.plotly_chart(fig, use_container_width=True)
 
     st.divider() 
-    col_sensors, col_control, col_status = st.columns(3)
+    col_sensors, col_status = st.columns(2)
     
-    # Fetch live data object
     latest = get_latest_leaf_data()
 
-    # BOTTOM LEFT: Live ESP32 Sensor Readings
     with col_sensors:
         st.subheader("📝 Live Sensor Readings")
         st.metric("Air Temperature", f"{latest.get('temp_air', 0.0):.1f} °C")
         st.metric("Leaf Temperature", f"{latest.get('temp_leaf', 0.0):.1f} °C")
         st.metric("Humidity", f"{latest.get('humidity', 0.0):.1f} %")
         st.metric("Spectral (Vio / Grn / Red)", f"{int(latest.get('spectral_vio', 0))} / {int(latest.get('spectral_grn', 0))} / {int(latest.get('spectral_red', 0))}")
+        st.button("📂 View Full Database", on_click=go_to_data_page)
     
-    # BOTTOM CENTER: Controls
-    with col_control:
-        st.subheader("⚙️ Controls")
-        st.write("Cuvette Servo Control")
-        c1, c2 = st.columns(2)
-        if c1.button("OPEN (ON)", type="primary", use_container_width=True):
-            if st.session_state.mqtt_client:
-                st.session_state.mqtt_client.publish("servo/command", "90")
-                st.toast("Servo moving to 90° (OPEN)")
-        
-        if c2.button("CLOSE (OFF)", use_container_width=True):
-            if st.session_state.mqtt_client:
-                st.session_state.mqtt_client.publish("servo/command", "180")
-                st.toast("Servo moving to 180° (CLOSED)")
-
-        st.divider()
-        st.button("📂 View Full Database", on_click=go_to_data_page, use_container_width=True)
-
-    # BOTTOM RIGHT: Optical Status
     with col_status:
-        st.subheader("⚠️ System Status")
+        st.subheader("⚠️ Cuvette Cycle Status")
         
-        # Real Optical Sensor Logic
-        optical_val = latest.get("optical_raw", 0)
-        threshold = 2500 # Based on your Arduino test limits
-        is_open = optical_val > threshold
+        mosfet_state = latest.get("mosfet_state", 0)
         
-        st.write(f"Raw Optical Reading: **{int(optical_val)}**")
-        if is_open:
-            st.success("✅ Cuvette: CLEAR / OPEN")
+        if mosfet_state == 1:
+            st.success("✅ **FLUSHING:** Solenoids OPEN (13 Min Cycle)")
         else:
-            st.error("🛑 Cuvette: BLOCKED / LEAF INSERTED")
+            st.warning("🛑 **SEALED:** Solenoids CLOSED (2 Min Cycle)")
 
         st.markdown("**System Messages:**")
         error_box = st.container(border=True)
-        error_box.write("No active errors.")
+        error_box.write("ESP32 Connection: Stable")
 
 # --- PAGE 2: DATA VIEW ---
 def render_data_view():
@@ -156,14 +120,13 @@ def render_data_view():
             st.dataframe(df, use_container_width=True)
             
             c1, c2 = st.columns(2)
-            c1.download_button(label="Download as CSV", data=df.to_csv(index=False).encode('utf-8'), file_name='sensor_data.csv', mime='text/csv', use_container_width=True)
-            c2.download_button(label="Download as JSON", data=df.to_json(orient='records'), file_name='sensor_data.json', mime='application/json', use_container_width=True)
+            c1.download_button(label="Download CSV", data=df.to_csv(index=False).encode('utf-8'), file_name='leaf_data.csv', mime='text/csv')
+            c2.download_button(label="Download JSON", data=df.to_json(orient='records'), file_name='leaf_data.json', mime='application/json')
         else:
             st.info("No data found in database.")
     else:
         st.error("Not connected to InfluxDB.")
 
-# --- MAIN ROUTER ---
 if st.session_state.page == 'dashboard':
     render_dashboard()
     time.sleep(REFRESH_RATE)

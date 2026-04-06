@@ -4,26 +4,25 @@
 #include <PubSubClient.h>
 #include <Adafruit_SHT31.h>
 #include <ArduinoJson.h>
+#include <SparkFun_AS7343.h> 
 
 // --- NETWORK CONFIGURATION ---
 const char* WIFI_SSID = "Leaf-Link";
 const char* WIFI_PASS = "cuvettemaster";
-const char* MQTT_SERVER = "10.42.0.1"; // The Pi's IP
+const char* MQTT_SERVER = "10.42.0.1";
 const int MQTT_PORT = 1883;
 
 // --- PIN DEFINITIONS ---
 #define SDA_PIN 1
 #define SCL_PIN 2
-#define THERMISTOR_PIN 4      // ADC1 on S3 (Safe)
+#define THERMISTOR_PIN 4      
 #define MOSFET_PIN 13
-
-// --- SPECTRAL SENSOR SETTINGS ---
-#define SPECTRAL_ADDR 0x39 
 
 // --- OBJECT INSTANTIATION ---
 WiFiClient espClient;
 PubSubClient client(espClient);
 Adafruit_SHT31 sht31 = Adafruit_SHT31();
+SfeAS7343ArdI2C mySensor; 
 
 // --- CONSTANTS (Thermistor) ---
 const float VCC = 3.30;
@@ -34,53 +33,22 @@ const float BETA = 3950.0;
 
 // --- VARIABLES FOR MULTITASKING & AVERAGING ---
 unsigned long lastMsgTime = 0;
-const long interval = 5000; // Publish every 5 seconds
+const long interval = 5000; 
 int sampleCount = 0;
 
 float sumShtTemp = 0;
 float sumShtHum = 0;
 float sumThermTemp = 0;
-long sumSpecVio = 0;
+long sumSpecBlu = 0;
 long sumSpecGrn = 0;
 long sumSpecRed = 0;
+unsigned long sumSpecTotal = 0; 
 
 // --- VARIABLES FOR MOSFET TIMING ---
 unsigned long previousMosfetTime = 0;
-const long mosfetOnDuration = 780000;  // 13 minutes in ms
-const long mosfetOffDuration = 120000; // 2 minutes in ms
+const long mosfetOnDuration = 780000;  
+const long mosfetOffDuration = 120000; 
 bool mosfetIsOn = false;
-
-// --- HELPER: SPECTRAL SENSOR ---
-void writeSpectralReg(byte reg, byte val) {
-  Wire.beginTransmission(SPECTRAL_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  Wire.endTransmission();
-}
-
-uint16_t readSpectral16() {
-  byte low = Wire.read();
-  byte high = Wire.read();
-  return (high << 8) | low;
-}
-
-void getSpectralData(uint16_t &vio, uint16_t &grn, uint16_t &red) {
-  Wire.beginTransmission(SPECTRAL_ADDR);
-  Wire.write(0x95); 
-  Wire.endTransmission();
-  
-  Wire.requestFrom((int)SPECTRAL_ADDR, 12);
-  if (Wire.available() == 12) {
-    vio = readSpectral16(); // 415nm
-    readSpectral16(); // Skip blu
-    readSpectral16(); // Skip grn (480nm)
-    readSpectral16(); // Skip yel
-    grn = readSpectral16(); // org (555nm) mapped to grn
-    red = readSpectral16(); // red (590nm)
-  } else {
-    vio = 0; grn = 0; red = 0;
-  }
-}
 
 // --- HELPER: THERMISTOR ---
 float getThermistorTemp() {
@@ -92,16 +60,26 @@ float getThermistorTemp() {
   return (1.0 / steinhart) - 273.15;
 }
 
-// --- MQTT CALLBACK (Receiving Commands) ---
-void callback(char* topic, byte* message, unsigned int length) {
-  // Empty for now, as MOSFET is running autonomously on a timer
+// --- HELPER: RAW I2C OVERRIDE ---
+void writeSpectralReg(byte reg, byte val) {
+  Wire.beginTransmission(0x39); // AS7343 Address
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
 }
+
+// --- MQTT CALLBACK ---
+void callback(char* topic, byte* message, unsigned int length) { }
 
 // --- NETWORK SETUP ---
 void setup_wifi() {
   delay(10);
-  Serial.print("Connecting to WiFi: "); Serial.println(WIFI_SSID);
+  Serial.print("\nConnecting to WiFi: "); 
+  Serial.println(WIFI_SSID);
+  
+  WiFi.mode(WIFI_STA); 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+  
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
@@ -115,9 +93,7 @@ void reconnect() {
     if (client.connect("ESP32LeafClient")) {
       Serial.println("connected");
     } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
+      Serial.print("failed, try again in 5 seconds");
       delay(5000);
     }
   }
@@ -127,25 +103,43 @@ void reconnect() {
 void setup() {
   Serial.begin(115200);
   
-  // 1. I2C & Pins
+  unsigned long waitStart = millis();
+  while (!Serial && millis() - waitStart < 5000) {
+    delay(10);
+  }
+  
+  Serial.println("\n\n--- ESP32 AWAKE AND CONNECTED ---");
+  
   Wire.begin(SDA_PIN, SCL_PIN);
   pinMode(THERMISTOR_PIN, INPUT);
-
-  // Initialize MOSFET Pin and start the cycle ON
+  
   pinMode(MOSFET_PIN, OUTPUT);
   digitalWrite(MOSFET_PIN, HIGH);
   mosfetIsOn = true;
   previousMosfetTime = millis();
   Serial.println("MOSFET: Initialized ON (Starting 13 min cycle)");
 
-  // 2. Hardware Init
   sht31.begin(0x44); 
-  writeSpectralReg(0x80, 0x0B); delay(100); 
-  writeSpectralReg(0xAA, 0x04); 
-  writeSpectralReg(0x81, 0xFF); 
-  writeSpectralReg(0x82, 0xFF); 
 
-  // 3. Network Init
+  // --- AS7343 SETUP ---
+  if (!mySensor.begin(0x39, Wire)) {
+    Serial.println("AS7343 failed to boot. Check wiring!");
+  } else {
+    mySensor.powerOn();
+    
+    // --- THE RAW SILICON OVERRIDE ---
+    // Bypassing the library to force the Gain and Exposure down
+    writeSpectralReg(0xAA, 0x00); // CFG1 Register: Sets Gain to 0.5x
+    writeSpectralReg(0x81, 0xFF); // ATIME Register: 0 (Fastest shutter)
+    writeSpectralReg(0x82, 0xFF); // ASTEP Register: 100 (Fastest shutter)
+    writeSpectralReg(0x83, 0x00); // ASTEP Register: 100 (Fastest shutter)
+
+    
+    mySensor.setAutoSmux(AUTOSMUX_18_CHANNELS); 
+    mySensor.enableSpectralMeasurement();
+    Serial.println("AS7343 Configured successfully (Manual overrides applied)!");
+  }
+
   setup_wifi();
   client.setServer(MQTT_SERVER, MQTT_PORT);
   client.setCallback(callback);
@@ -161,17 +155,17 @@ void loop() {
   // --- MOSFET TIMER LOGIC ---
   if (mosfetIsOn) {
     if (currentMillis - previousMosfetTime >= mosfetOnDuration) {
-      digitalWrite(MOSFET_PIN, LOW); // Turn OFF
+      digitalWrite(MOSFET_PIN, LOW); 
       mosfetIsOn = false;
       previousMosfetTime = currentMillis;
-      Serial.println("MOSFET: Switched OFF (Starting 2 min cycle)");
+      Serial.println("MOSFET: Switched OFF");
     }
   } else {
     if (currentMillis - previousMosfetTime >= mosfetOffDuration) {
-      digitalWrite(MOSFET_PIN, HIGH); // Turn ON
+      digitalWrite(MOSFET_PIN, HIGH); 
       mosfetIsOn = true;
       previousMosfetTime = currentMillis;
-      Serial.println("MOSFET: Switched ON (Starting 13 min cycle)");
+      Serial.println("MOSFET: Switched ON");
     }
   }
 
@@ -187,11 +181,20 @@ void loop() {
     
     sumThermTemp += getThermistorTemp();
     
-    uint16_t v, g, r;
-    getSpectralData(v, g, r);
-    sumSpecVio += v;
-    sumSpecGrn += g;
-    sumSpecRed += r;
+    // --- AS7343 DATA GRAB ---
+    if (mySensor.readSpectraDataFromSensor()) {
+      uint16_t b = mySensor.getBlue();
+      uint16_t g = mySensor.getGreen();
+      uint16_t r = mySensor.getRed();
+      
+      // Calculate total Visible Light (Proxy for PAR) while ignoring the Clear & NIR channels
+      uint32_t total = b + g + r;
+
+      sumSpecBlu += b;
+      sumSpecGrn += g;  
+      sumSpecRed += r;
+      sumSpecTotal += total;
+    }
     
     sampleCount++;
   }
@@ -201,31 +204,27 @@ void loop() {
     lastMsgTime = currentMillis;
 
     if (sampleCount > 0) {
-      StaticJsonDocument<512> doc;
+      JsonDocument doc;
       doc["sensor"] = "leaf_node_1";
       doc["temp_air"] = sumShtTemp / sampleCount;
       doc["humidity"] = sumShtHum / sampleCount;
       doc["temp_leaf"] = sumThermTemp / sampleCount;
       
-      doc["spectral_vio"] = sumSpecVio / sampleCount;
+      doc["spectral_blu"] = sumSpecBlu / sampleCount;
       doc["spectral_grn"] = sumSpecGrn / sampleCount;
       doc["spectral_red"] = sumSpecRed / sampleCount;
-      
-      doc["mosfet_state"] = mosfetIsOn ? 1 : 0; // 1 if ON, 0 if OFF
+      doc["spectral_total"] = sumSpecTotal / sampleCount; 
+      doc["mosfet_state"] = mosfetIsOn ? 1 : 0; 
 
       char buffer[512];
       serializeJson(doc, buffer);
       
       client.publish("sensors/leaf_1", buffer);
-      
       Serial.println("Published: " + String(buffer));
-      Serial.print("AirTemp: "); Serial.println(sumShtTemp / sampleCount);
-      Serial.print("AirHum: ");  Serial.println(sumShtHum / sampleCount);
-      Serial.println();
-
+      
       // Reset accumulators
       sumShtTemp = 0; sumShtHum = 0; sumThermTemp = 0;
-      sumSpecVio = 0; sumSpecGrn = 0; sumSpecRed = 0;
+      sumSpecBlu = 0; sumSpecGrn = 0; sumSpecRed = 0; sumSpecTotal = 0;
       sampleCount = 0;
     }
   }

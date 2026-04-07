@@ -23,32 +23,56 @@ if 'page' not in st.session_state:
     st.session_state.page = 'dashboard'
 
 # --- HELPER FUNCTIONS ---
-def get_recent_data(measurement, limit=50):
+def get_aggregated_data(limit=1000):
+    """
+    Queries InfluxDB to bucket ALL data into 5-second intervals,
+    averages it, and merges both sensors into a single row.
+    """
     client = st.session_state.influx_client
-    if client:
-        try:
-            result = client.query(f'SELECT * FROM "{measurement}" ORDER BY time DESC LIMIT {limit}')
-            points = list(result.get_points())
-            if points:
-                df = pd.DataFrame(points)
-                df['time'] = pd.to_datetime(df['time'])
-                return df
-        except:
-            pass
-    dates = pd.date_range(end=pd.Timestamp.now(), periods=limit, freq='S')
-    return pd.DataFrame({'time': dates, 'value': np.random.uniform(20, 30, limit)})
+    if not client:
+        return pd.DataFrame()
+        
+    query = f'''
+    SELECT mean(*) FROM "li7810_sensors", "leaf_sensors" 
+    WHERE time > now() - 24h 
+    GROUP BY time(5s) fill(none) 
+    ORDER BY time DESC LIMIT {limit}
+    '''
+    try:
+        result = client.query(query)
+        data_list = list(result.items())
+        
+        df_final = pd.DataFrame()
+        for (meta, res) in data_list:
+            temp_df = pd.DataFrame(list(res))
+            if not temp_df.empty:
+                # Remove InfluxDB's automatic "mean_" prefix to keep headers clean
+                temp_df.columns = [col.replace('mean_', '') for col in temp_df.columns]
+                
+                # Merge the LiCor and ESP32 dataframes side-by-side based on the timestamp
+                if df_final.empty:
+                    df_final = temp_df
+                else:
+                    df_final = pd.merge(df_final, temp_df, on='time', how='outer')
+                    
+        if not df_final.empty:
+            df_final['time'] = pd.to_datetime(df_final['time'])
+            df_final = df_final.sort_values('time', ascending=False).reset_index(drop=True)
+            
+        return df_final
+    except Exception as e:
+        st.error(f"Database error: {e}")
+        return pd.DataFrame()
 
 def get_latest_leaf_data():
-    """Fetches the absolute latest reading from the ESP32"""
+    """Fetches the absolute latest raw reading from the ESP32 for the UI Metrics"""
     client = st.session_state.influx_client
     if client:
         try:
             result = client.query('SELECT * FROM "leaf_sensors" ORDER BY time DESC LIMIT 1')
             points = list(result.get_points())
-            if points:
-                return points[0]
-        except:
-            pass
+            if points: return points[0]
+        except: pass
     return {}
 
 def go_to_data_page(): st.session_state.page = 'data_view'
@@ -58,24 +82,31 @@ def go_to_home(): st.session_state.page = 'dashboard'
 def render_dashboard():
     st.title("🌱 Leaf Cuvette Dashboard")
 
+    # Fetch the synced data once for all three charts
+    df = get_aggregated_data(limit=60) 
+
     col_co2, col_ch4, col_h2o = st.columns(3)
-    with col_co2:
-        st.markdown("### ☁️ CO2 (ppm)")
-        fig = px.line(get_recent_data("co2"), x='time', y='value', template="plotly_dark", height=300)
-        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+    
+    if not df.empty and 'co2' in df.columns:
+        with col_co2:
+            st.markdown("### ☁️ CO2 (ppm)")
+            fig = px.line(df, x='time', y='co2', template="plotly_dark", height=300)
+            fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+            st.plotly_chart(fig, use_container_width=True)
 
-    with col_ch4:
-        st.markdown("### 💨 CH4 (ppb)")
-        fig = px.line(get_recent_data("ch4"), x='time', y='value', template="plotly_dark", height=300)
-        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+        with col_ch4:
+            st.markdown("### 💨 CH4 (ppb)")
+            fig = px.line(df, x='time', y='ch4', template="plotly_dark", height=300)
+            fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+            st.plotly_chart(fig, use_container_width=True)
 
-    with col_h2o:
-        st.markdown("### 💧 H2O (mmol)")
-        fig = px.line(get_recent_data("h2o"), x='time', y='value', template="plotly_dark", height=300)
-        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+        with col_h2o:
+            st.markdown("### 💧 H2O (mmol)")
+            fig = px.line(df, x='time', y='h2o', template="plotly_dark", height=300)
+            fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Waiting for synchronized data to plot...")
 
     st.divider() 
     col_sensors, col_status = st.columns(2)
@@ -87,7 +118,7 @@ def render_dashboard():
         st.metric("Air Temperature", f"{latest.get('temp_air', 0.0):.1f} °C")
         st.metric("Leaf Temperature", f"{latest.get('temp_leaf', 0.0):.1f} °C")
         st.metric("Humidity", f"{latest.get('humidity', 0.0):.1f} %")
-        st.metric("Spectral (Vio / Grn / Red)", f"{int(latest.get('spectral_vio', 0))} / {int(latest.get('spectral_grn', 0))} / {int(latest.get('spectral_red', 0))}")
+        st.metric("Spectral Total", f"{int(latest.get('spectral_total', 0))}")
         st.button("📂 View Full Database", on_click=go_to_data_page)
     
     with col_status:
@@ -106,26 +137,22 @@ def render_dashboard():
 
 # --- PAGE 2: DATA VIEW ---
 def render_data_view():
-    st.title("📂 Database Records")
+    st.title("📂 Unified Research Records")
     st.button("⬅️ Return to Dashboard", on_click=go_to_home)
     
-    client = st.session_state.influx_client
-    if client:
-        result = client.query('SELECT * FROM "leaf_sensors" ORDER BY time DESC LIMIT 1000')
-        points = list(result.get_points())
+    df = get_aggregated_data(limit=1000)
+    
+    if not df.empty:
+        st.dataframe(df, use_container_width=True)
         
-        if points:
-            df = pd.DataFrame(points)
-            df['time'] = pd.to_datetime(df['time'])
-            st.dataframe(df, use_container_width=True)
-            
-            c1, c2 = st.columns(2)
-            c1.download_button(label="Download CSV", data=df.to_csv(index=False).encode('utf-8'), file_name='leaf_data.csv', mime='text/csv')
-            c2.download_button(label="Download JSON", data=df.to_json(orient='records'), file_name='leaf_data.json', mime='application/json')
-        else:
-            st.info("No data found in database.")
+        c1, c2 = st.columns(2)
+        csv_data = df.to_csv(index=False).encode('utf-8')
+        json_data = df.to_json(orient='records')
+        
+        c1.download_button("Download Unified CSV", data=csv_data, file_name='leaf_data_synced.csv', mime='text/csv')
+        c2.download_button("Download Unified JSON", data=json_data, file_name='leaf_data_synced.json', mime='application/json')
     else:
-        st.error("Not connected to InfluxDB.")
+        st.info("No data found in database. Check connections.")
 
 if st.session_state.page == 'dashboard':
     render_dashboard()

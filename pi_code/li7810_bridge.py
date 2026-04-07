@@ -20,16 +20,18 @@ def on_connect(client, userdata, flags, rc):
 def on_message(client, userdata, msg):
     try:
         raw_payload = json.loads(msg.payload.decode())
-        
-        # Dig into the "Concentration" envelope
         data = raw_payload.get("Concentration", {})
         
         if not data:
             return 
 
+        # Extract specific headers, defaulting to 0 if missing
         h2o = data.get("H2O", 0.0)
         co2 = data.get("CO2", 0.0)
         ch4 = data.get("CH4", 0.0)
+        diag = data.get("DIAG", 0)
+        rdt = data.get("RING_DOWN_TIME", 0.0)
+        chk = data.get("CHK", 0)
 
         json_body = [
             {
@@ -41,13 +43,16 @@ def on_message(client, userdata, msg):
                 "fields": {
                     "h2o": float(h2o),
                     "co2": float(co2),
-                    "ch4": float(ch4)
+                    "ch4": float(ch4),
+                    "diag": int(diag), 
+                    "ring_down_time": float(rdt),
+                    "checksum": int(chk)
                 }
             }
         ]
         
         db_client.write_points(json_body)
-        print(f" -> Saved LI-7810 Data: H2O: {h2o:.1f}, CO2: {co2:.1f}, CH4: {ch4:.1f}")
+        print(f" -> Saved LI-7810: CO2: {co2:.1f}, CH4: {ch4:.1f}, RDT: {rdt:.4f}, DIAG: {diag}")
         
     except Exception as e:
         print(f"Error processing LI-7810 message: {e}")

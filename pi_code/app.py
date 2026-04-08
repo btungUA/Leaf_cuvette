@@ -101,7 +101,7 @@ def render_dashboard():
             st.plotly_chart(fig, use_container_width=True)
 
         with col_h2o:
-            st.markdown("### 💧 H2O (mmol)")
+            st.markdown("### 💧 H2O (ppm)")
             fig = px.line(df, x='time', y='h2o', template="plotly_dark", height=300)
             fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
             st.plotly_chart(fig, use_container_width=True)
@@ -137,20 +137,28 @@ def render_dashboard():
 
 # --- PAGE 2: DATA VIEW ---
 def render_data_view():
-    st.title("📂 Unified Research Records")
-    st.button("⬅️ Return to Dashboard", on_click=go_to_home)
+    st.title("📂 Database Records")
+    st.button("⬅️ Return to Home", on_click=go_to_home)
     
     df = get_aggregated_data(limit=1000)
     
     if not df.empty:
+	# Force 'time' to be the index
+        df = df.set_index('time')
+	# Define ideal column order
+        ideal_order = ['co2', 'ch4', 'h2o', 'temp_leaf', 'temp_air', 'humidity', 'spectral_total', 'diag', 'ring_down_time', 'mosfet_state']
+	# Reorder dataframe only showing what exist
+        current_cols = [col for col in ideal_order if col in df.columns]
+        df = df[current_cols]
+	# Display the clean table
         st.dataframe(df, use_container_width=True)
         
         c1, c2 = st.columns(2)
-        csv_data = df.to_csv(index=False).encode('utf-8')
-        json_data = df.to_json(orient='records')
+        csv_data = df.reset_index().to_csv(index=False).encode('utf-8')
+        json_data = df.reset_index().to_json(orient='records')
         
-        c1.download_button("Download Unified CSV", data=csv_data, file_name='leaf_data_synced.csv', mime='text/csv')
-        c2.download_button("Download Unified JSON", data=json_data, file_name='leaf_data_synced.json', mime='application/json')
+        c1.download_button("Download CSV", data=csv_data, file_name='leaf_data.csv', mime='text/csv')
+        c2.download_button("Download JSON", data=json_data, file_name='leaf_data.json', mime='application/json')
     else:
         st.info("No data found in database. Check connections.")
 

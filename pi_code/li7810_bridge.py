@@ -57,7 +57,7 @@ def on_message(client, userdata, msg):
     except Exception as e:
         print(f"Error processing LI-7810 message: {e}")
 
-client = mqtt.Client()
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
 client.on_connect = on_connect
 client.on_message = on_message
 

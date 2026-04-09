@@ -25,13 +25,14 @@ def on_message(client, userdata, msg):
         if not data:
             return 
 
-        # Extract specific headers, defaulting to 0 if missing
+        # Extract specific headers
         h2o = data.get("H2O", 0.0)
         co2 = data.get("CO2", 0.0)
         ch4 = data.get("CH4", 0.0)
         diag = data.get("DIAG", 0)
         rdt = data.get("RING_DOWN_TIME", 0.0)
         chk = data.get("CHK", 0)
+        remark = data.get("REMARK", "") # Catch the new string
 
         json_body = [
             {
@@ -46,13 +47,14 @@ def on_message(client, userdata, msg):
                     "ch4": float(ch4),
                     "diag": int(diag), 
                     "ring_down_time": float(rdt),
-                    "checksum": int(chk)
+                    "checksum": int(chk),
+                    "remark": str(remark) # Explicitly cast as text
                 }
             }
         ]
         
         db_client.write_points(json_body)
-        print(f" -> Saved LI-7810: CO2: {co2:.1f}, CH4: {ch4:.1f}, RDT: {rdt:.4f}, DIAG: {diag}")
+        print(f" -> Saved LI-7810: CO2: {co2:.1f}, CH4: {ch4:.1f}, DIAG: {diag}, REMARK: {remark}")
         
     except Exception as e:
         print(f"Error processing LI-7810 message: {e}")

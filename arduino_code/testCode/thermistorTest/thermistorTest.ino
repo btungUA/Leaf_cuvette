@@ -32,11 +32,14 @@ void loop() {
   steinhart = 1.0 / steinhart;
   float tempC = steinhart - 273.15;
 
+  float corrected = (((tempC - 32.21) * 30.4) / 14.29) + 1.9;
+
   Serial.print("RAW: "); Serial.print(raw);
   Serial.print("  Vnode: "); Serial.print(voltage, 3);
   Serial.print(" V  Rtherm: "); Serial.print(Rtherm, 0);
   Serial.print(" ohm  Temp: "); Serial.print(tempC, 2);
   Serial.println(" C");
+  Serial.print("Corrected: "); Serial.println(corrected, 2);
 
   delay(500);
 }

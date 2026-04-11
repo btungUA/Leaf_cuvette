@@ -101,13 +101,15 @@ def go_to_data_page(): st.session_state.page = 'data_view'
 def go_to_home(): st.session_state.page = 'dashboard'
 
 # --- PAGE 1: DASHBOARD ---
-def render_dashboard():
-    st.title("🌱 Leaf Cuvette Dashboard")
+# --- PAGE 1: DASHBOARD ---
 
+# 1. The Fragment Decorator: This tells Streamlit to ONLY refresh 
+# the code inside this specific function every 2 seconds.
+@st.fragment(run_every=2)
+def render_live_stream():
     df = get_aggregated_data(limit=60) 
 
     col_co2, col_ch4, col_h2o = st.columns(3)
-    
     if not df.empty and 'co2' in df.columns:
         with col_co2:
             st.markdown("### ☁️ CO2 (ppm)")
@@ -131,7 +133,6 @@ def render_dashboard():
 
     st.divider() 
     col_sensors, col_status = st.columns(2)
-    
     latest = get_latest_leaf_data()
 
     with col_sensors:
@@ -140,20 +141,29 @@ def render_dashboard():
         st.metric("Leaf Temperature", f"{latest.get('temp_leaf', 0.0):.1f} °C")
         st.metric("Humidity", f"{latest.get('humidity', 0.0):.1f} %")
         st.metric("Spectral Total", f"{int(latest.get('spectral_total', 0))}")
-        st.button("📂 View Full Database", on_click=go_to_data_page)
     
     with col_status:
         st.subheader("⚠️ Cuvette Cycle Status")
         mosfet_state = latest.get("mosfet_state", 0)
-        
         if mosfet_state == 1:
-            st.success("✅ **FLUSHING:** Solenoids OPEN (13 Min Cycle)")
+            st.success("✅ **FLUSHING:** Solenoids OPEN")
         else:
-            st.warning("🛑 **SEALED:** Solenoids CLOSED (2 Min Cycle)")
-
-        st.markdown("**System Messages:**")
+            st.warning("🛑 **SEALED:** Solenoids CLOSED")
         error_box = st.container(border=True)
         error_box.write("ESP32 Connection: Stable")
+
+# 2. The Main Page Function
+def render_dashboard():
+    c_title, c_btn = st.columns([4, 1])
+    c_title.title("🌱 Leaf Cuvette Dashboard")
+    
+    # We place the navigation button OUTSIDE the fragment.
+    # It will never glitch, because it isn't trapped in the refresh loop!
+    c_btn.button("📂 View Full Database", on_click=go_to_data_page)
+    
+    # Call the self-refreshing module
+    render_live_stream()
+
 
 # --- PAGE 2: DATA VIEW ---
 def render_data_view():
@@ -208,9 +218,9 @@ def render_data_view():
     else:
         st.info("No data found in database. Check connections.")
 
+# --- APP ROUTING ---
+# We no longer need any time.sleep() logic down here!
 if st.session_state.page == 'dashboard':
     render_dashboard()
-    time.sleep(REFRESH_RATE)
-    st.rerun()
 elif st.session_state.page == 'data_view':
     render_data_view()

@@ -57,7 +57,8 @@ float getThermistorTemp() {
   float voltage = adcVal * (VCC / 4095.0);
   float Rtherm = (SERIES_R * (VCC / voltage - 1.0));
   float steinhart = log(Rtherm / R0) / BETA + 1.0 / T0;
-  return (1.0 / steinhart) - 273.15;
+  float tempC = (1.0 / steinhart) - 273.15;
+  return (((tempC - 32.21) * 30.4) / 14.29) + 1.9;
 }
 
 // --- HELPER: RAW I2C OVERRIDE ---
@@ -128,13 +129,20 @@ void setup() {
     mySensor.powerOn();
     
     // --- THE RAW SILICON OVERRIDE ---
-    // Bypassing the library to force the Gain and Exposure down
-    writeSpectralReg(0xAA, 0x00); // CFG1 Register: Sets Gain to 0.5x
-    writeSpectralReg(0x81, 0xFF); // ATIME Register: 0 (Fastest shutter)
-    writeSpectralReg(0x82, 0xFF); // ASTEP Register: 100 (Fastest shutter)
-    writeSpectralReg(0x83, 0x00); // ASTEP Register: 100 (Fastest shutter)
+    // 1. Set Gain to 0.5x (Lowest Sensitivity)
+    // Register 0xC6 (CFG1), Value 0x00 = 0.5x
+    writeSpectralReg(0xC6, 0x00); 
 
-    
+    // 2. Set ATIME to 0
+    // Register 0x81 (ATIME), Value 0x00
+    writeSpectralReg(0x81, 0x00); 
+
+    // 3. Set ASTEP to 1 (Fastest legal shutter speed)
+    // Register 0xD4 (ASTEP LSB), Value 0x01
+    writeSpectralReg(0xD4, 0x01); 
+    // Register 0xD5 (ASTEP MSB), Value 0x00
+    writeSpectralReg(0xD5, 0x00); 
+
     mySensor.setAutoSmux(AUTOSMUX_18_CHANNELS); 
     mySensor.enableSpectralMeasurement();
     Serial.println("AS7343 Configured successfully (Manual overrides applied)!");

@@ -109,7 +109,7 @@ void setup() {
     delay(10);
   }
   
-  Serial.println("\n\n--- ESP32 AWAKE AND CONNECTED ---");
+  Serial.println("\n\n--- ESP32 AWAKE ---");
   
   Wire.begin(SDA_PIN, SCL_PIN);
   pinMode(THERMISTOR_PIN, INPUT);
@@ -118,34 +118,20 @@ void setup() {
   digitalWrite(MOSFET_PIN, HIGH);
   mosfetIsOn = true;
   previousMosfetTime = millis();
-  Serial.println("MOSFET: Initialized ON (Starting 13 min cycle)");
 
   sht31.begin(0x44); 
 
-  // --- AS7343 SETUP ---
   if (!mySensor.begin(0x39, Wire)) {
-    Serial.println("AS7343 failed to boot. Check wiring!");
+    Serial.println("AS7343 failed!");
   } else {
     mySensor.powerOn();
-    
-    // --- THE RAW SILICON OVERRIDE ---
-    // 1. Set Gain to 0.5x (Lowest Sensitivity)
-    // Register 0xC6 (CFG1), Value 0x00 = 0.5x
-    writeSpectralReg(0xC6, 0x00); 
-
-    // 2. Set ATIME to 0
-    // Register 0x81 (ATIME), Value 0x00
-    writeSpectralReg(0x81, 0x00); 
-
-    // 3. Set ASTEP to 1 (Fastest legal shutter speed)
-    // Register 0xD4 (ASTEP LSB), Value 0x01
-    writeSpectralReg(0xD4, 0x01); 
-    // Register 0xD5 (ASTEP MSB), Value 0x00
-    writeSpectralReg(0xD5, 0x00); 
+    writeSpectralReg(0xC6, 0x02); 
+    writeSpectralReg(0x81, 0x1D); 
+    writeSpectralReg(0xD4, 0xE7); 
+    writeSpectralReg(0xD5, 0x03); 
 
     mySensor.setAutoSmux(AUTOSMUX_18_CHANNELS); 
     mySensor.enableSpectralMeasurement();
-    Serial.println("AS7343 Configured successfully (Manual overrides applied)!");
   }
 
   setup_wifi();
@@ -166,14 +152,12 @@ void loop() {
       digitalWrite(MOSFET_PIN, LOW); 
       mosfetIsOn = false;
       previousMosfetTime = currentMillis;
-      Serial.println("MOSFET: Switched OFF");
     }
   } else {
     if (currentMillis - previousMosfetTime >= mosfetOffDuration) {
       digitalWrite(MOSFET_PIN, HIGH); 
       mosfetIsOn = true;
       previousMosfetTime = currentMillis;
-      Serial.println("MOSFET: Switched ON");
     }
   }
 
@@ -189,21 +173,17 @@ void loop() {
     
     sumThermTemp += getThermistorTemp();
     
-    // --- AS7343 DATA GRAB ---
     if (mySensor.readSpectraDataFromSensor()) {
       uint16_t b = mySensor.getBlue();
       uint16_t g = mySensor.getGreen();
       uint16_t r = mySensor.getRed();
       
-      // Calculate total Visible Light (Proxy for PAR) while ignoring the Clear & NIR channels
-      uint32_t total = b + g + r;
-
       sumSpecBlu += b;
       sumSpecGrn += g;  
       sumSpecRed += r;
-      sumSpecTotal += total;
+      // Accumulate the raw sum of channels for the PAR calculation
+      sumSpecTotal += (b + g + r);
     }
-    
     sampleCount++;
   }
 
@@ -212,16 +192,23 @@ void loop() {
     lastMsgTime = currentMillis;
 
     if (sampleCount > 0) {
+      // Calculate averages
+      float avgRawSpectralSum = (float)sumSpecTotal / sampleCount;
+      
+      // Apply the calibration equation: PAR = 0.2114 * x - 0.3242
+      float calibratedPAR = (0.2114 * avgRawSpectralSum) - 0.3242;
+      if (calibratedPAR < 0) calibratedPAR = 0.0; // Prevent negative readings
+
       JsonDocument doc;
       doc["sensor"] = "leaf_node_1";
       doc["temp_air"] = sumShtTemp / sampleCount;
       doc["humidity"] = sumShtHum / sampleCount;
       doc["temp_leaf"] = sumThermTemp / sampleCount;
       
-      doc["spectral_blu"] = sumSpecBlu / sampleCount;
-      doc["spectral_grn"] = sumSpecGrn / sampleCount;
-      doc["spectral_red"] = sumSpecRed / sampleCount;
-      doc["spectral_total"] = sumSpecTotal / sampleCount; 
+      doc["spectral_blu"] = (float)sumSpecBlu / sampleCount;
+      doc["spectral_grn"] = (float)sumSpecGrn / sampleCount;
+      doc["spectral_red"] = (float)sumSpecRed / sampleCount;
+      doc["par_value"] = calibratedPAR; 
       doc["mosfet_state"] = mosfetIsOn ? 1 : 0; 
 
       char buffer[512];

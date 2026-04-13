@@ -1,14 +1,11 @@
 import streamlit as st
 from influxdb import InfluxDBClient
 import pandas as pd
-import time
-import datetime # Required for the new scheduler
+import datetime
 import plotly.express as px
-import numpy as np
 
 # --- CONFIGURATION ---
 INFLUX_DB = "sensor_data"
-REFRESH_RATE = 2 
 
 st.set_page_config(page_title="Leaf Cuvette Dashboard", layout="wide")
 
@@ -25,61 +22,64 @@ if 'page' not in st.session_state:
 
 # --- HELPER FUNCTIONS ---
 def get_aggregated_data(start_time=None, end_time=None, limit=1000):
-    """
-    Queries InfluxDB to bucket ALL data into 5-second intervals.
-    Filters by specific timeframe if requested, and protects diagnostic integers.
-    """
     client = st.session_state.influx_client
-    if not client:
-        return pd.DataFrame()
+    if not client: return pd.DataFrame()
         
-    # Set the timeframe boundaries
     if start_time and end_time:
-        start_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
-        end_str = end_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+        # 1. Silently convert local time to InfluxDB UTC (+7 hours)
+        start_utc = start_time + datetime.timedelta(hours=7)
+        end_utc = end_time + datetime.timedelta(hours=7)
+        
+        start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+        end_str = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
         time_clause = f"time >= '{start_str}' AND time <= '{end_str}'"
-        limit_clause = "" # Pull all data within range
+        limit_clause = "" 
     else:
         time_clause = "time > now() - 24h"
         limit_clause = f"LIMIT {limit}"
 
-    # Explicitly typed query to protect max("diag") and last("remark")
-    query = f'''
-    SELECT 
-        mean("co2") as "co2", 
-        mean("ch4") as "ch4", 
-        mean("h2o") as "h2o", 
-        mean("temp_leaf") as "temp_leaf", 
-        mean("temp_air") as "temp_air", 
-        mean("humidity") as "humidity", 
-        mean("spectral_total") as "spectral_total", 
-        mean("ring_down_time") as "ring_down_time",
-        max("diag") as "diag", 
-        last("checksum") as "checksum",
-        last("mosfet_state") as "mosfet_state",
-        last("remark") as "remark"
-    FROM "li7810_sensors", "leaf_sensors" 
-    WHERE {time_clause} 
-    GROUP BY time(5s) fill(none) 
-    ORDER BY time DESC {limit_clause}
+    # 2. Split the queries to prevent InfluxDB from panicking!
+    q_licor = f'''
+    SELECT mean("co2") as "co2", mean("ch4") as "ch4", mean("h2o") as "h2o", 
+           mean("ring_down_time") as "ring_down_time", max("diag") as "diag", 
+           last("checksum") as "checksum", last("remark") as "remark"
+    FROM "li7810_sensors" WHERE {time_clause} GROUP BY time(5s) fill(none) ORDER BY time DESC {limit_clause}
+    '''
+    
+    q_esp = f'''
+    SELECT mean("temp_leaf") as "temp_leaf", mean("temp_air") as "temp_air", 
+           mean("humidity") as "humidity", mean("spectral_total") as "spectral_total", 
+           last("mosfet_state") as "mosfet_state"
+    FROM "leaf_sensors" WHERE {time_clause} GROUP BY time(5s) fill(none) ORDER BY time DESC {limit_clause}
     '''
 
     try:
-        result = client.query(query)
-        data_list = list(result.items())
-        
-        df_final = pd.DataFrame()
-        for (meta, res) in data_list:
-            temp_df = pd.DataFrame(list(res))
-            if not temp_df.empty:
-                # No longer need to replace "mean_" because the SQL query renames the columns!
-                if df_final.empty:
-                    df_final = temp_df
-                else:
-                    df_final = pd.merge(df_final, temp_df, on='time', how='outer')
-                    
+        # Execute independently
+        df_licor = pd.DataFrame()
+        res_licor = list(client.query(q_licor).get_points())
+        if res_licor: df_licor = pd.DataFrame(res_licor)
+
+        df_esp = pd.DataFrame()
+        res_esp = list(client.query(q_esp).get_points())
+        if res_esp: df_esp = pd.DataFrame(res_esp)
+
+        # Merge safely in Python
+        if df_licor.empty and df_esp.empty:
+            return pd.DataFrame()
+        elif df_licor.empty:
+            df_final = df_esp
+        elif df_esp.empty:
+            df_final = df_licor
+        else:
+            df_final = pd.merge(df_licor, df_esp, on='time', how='outer')
+
         if not df_final.empty:
-            df_final['time'] = pd.to_datetime(df_final['time'])
+            # 3. Parse the time and strictly enforce UTC so Pandas doesn't get confused
+            df_final['time'] = pd.to_datetime(df_final['time'], utc=True)
+            
+            # 4. Convert to Arizona time, then strip the timezone wrapper for Streamlit
+            df_final['time'] = df_final['time'].dt.tz_convert('America/Phoenix').dt.tz_localize(None)
+            
             df_final = df_final.sort_values('time', ascending=False).reset_index(drop=True)
             
         return df_final
@@ -101,10 +101,6 @@ def go_to_data_page(): st.session_state.page = 'data_view'
 def go_to_home(): st.session_state.page = 'dashboard'
 
 # --- PAGE 1: DASHBOARD ---
-# --- PAGE 1: DASHBOARD ---
-
-# 1. The Fragment Decorator: This tells Streamlit to ONLY refresh 
-# the code inside this specific function every 2 seconds.
 @st.fragment(run_every=2)
 def render_live_stream():
     df = get_aggregated_data(limit=60) 
@@ -140,7 +136,7 @@ def render_live_stream():
         st.metric("Air Temperature", f"{latest.get('temp_air', 0.0):.1f} °C")
         st.metric("Leaf Temperature", f"{latest.get('temp_leaf', 0.0):.1f} °C")
         st.metric("Humidity", f"{latest.get('humidity', 0.0):.1f} %")
-        st.metric("Spectral Total", f"{int(latest.get('spectral_total', 0))}")
+        st.metric("PAR", f"{latest.get('spectral_total') or 0.0:.2f}")
     
     with col_status:
         st.subheader("⚠️ Cuvette Cycle Status")
@@ -152,16 +148,10 @@ def render_live_stream():
         error_box = st.container(border=True)
         error_box.write("ESP32 Connection: Stable")
 
-# 2. The Main Page Function
 def render_dashboard():
     c_title, c_btn = st.columns([4, 1])
     c_title.title("🌱 Leaf Cuvette Dashboard")
-    
-    # We place the navigation button OUTSIDE the fragment.
-    # It will never glitch, because it isn't trapped in the refresh loop!
     c_btn.button("📂 View Full Database", on_click=go_to_data_page)
-    
-    # Call the self-refreshing module
     render_live_stream()
 
 
@@ -188,7 +178,6 @@ def render_data_view():
     use_custom = st.checkbox("Apply Date/Time Filter (Uncheck to view latest 1000 records)")
     st.divider()
     
-    # Fetch based on toggle
     if use_custom:
         df = get_aggregated_data(start_time=start_dt, end_time=end_dt)
         if not df.empty:
@@ -197,21 +186,19 @@ def render_data_view():
         df = get_aggregated_data(limit=1000)
     
     if not df.empty:
-        # Promote real time column to index
         df = df.set_index('time')
-        
-        # Included checksum and remark in the ideal order
         ideal_order = ['co2', 'ch4', 'h2o', 'temp_leaf', 'temp_air', 'humidity', 'spectral_total', 'diag', 'ring_down_time', 'checksum', 'mosfet_state', 'remark']
-        
         current_cols = [col for col in ideal_order if col in df.columns]
         df = df[current_cols]
         
-        st.dataframe(df, use_container_width=True)
+        # Clean up the column name for the display table and CSV exports
+        df_display = df.rename(columns={'spectral_total': 'par'})
+        
+        st.dataframe(df_display, use_container_width=True)
         
         c1, c2 = st.columns(2)
-        # Reset index for downloads to preserve the timestamp column
-        csv_data = df.reset_index().to_csv(index=False).encode('utf-8')
-        json_data = df.reset_index().to_json(orient='records')
+        csv_data = df_display.reset_index().to_csv(index=False).encode('utf-8')
+        json_data = df_display.reset_index().to_json(orient='records')
         
         c1.download_button("Download CSV", data=csv_data, file_name='leaf_data.csv', mime='text/csv')
         c2.download_button("Download JSON", data=json_data, file_name='leaf_data.json', mime='application/json')
@@ -219,7 +206,6 @@ def render_data_view():
         st.info("No data found in database. Check connections.")
 
 # --- APP ROUTING ---
-# We no longer need any time.sleep() logic down here!
 if st.session_state.page == 'dashboard':
     render_dashboard()
 elif st.session_state.page == 'data_view':

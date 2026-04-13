@@ -42,7 +42,7 @@ def on_message(client, userdata, msg):
         
         db_client.write_points(json_body)
         # Updated print statement to show RDT and CHK
-        print(f" -> LI-7810 | CO2: {co2:.1f} | CH4: {ch4:.1f} | RDT: {rdt:.4f} | DIAG: {diag} | CHK: {chk} | REMARK: {remark}")
+        print(f" -> LI-7810 | CO2: {co2:.1f} | H2O: {h2o:.1f} | CH4: {ch4:.1f} | RDT: {rdt:.4f} | DIAG: {diag} | CHK: {chk} | REMARK: {remark}")
         
     except Exception as e:
         # This catches the blank strings during laser warmup!

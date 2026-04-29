@@ -48,7 +48,7 @@ def get_aggregated_data(start_time=None, end_time=None, limit=1000):
     
     q_esp = f'''
     SELECT mean("temp_leaf") as "temp_leaf", mean("temp_air") as "temp_air", 
-           mean("humidity") as "humidity", mean("spectral_total") as "spectral_total", 
+           mean("humidity") as "humidity", mean("par_value") as "par_value", 
            last("mosfet_state") as "mosfet_state"
     FROM "leaf_sensors" WHERE {time_clause} GROUP BY time(5s) fill(none) ORDER BY time DESC {limit_clause}
     '''
@@ -108,19 +108,19 @@ def render_live_stream():
     col_co2, col_ch4, col_h2o = st.columns(3)
     if not df.empty and 'co2' in df.columns:
         with col_co2:
-            st.markdown("### ☁️ CO2 (ppm)")
+            st.markdown("###  CO2 (ppm)")
             fig = px.line(df, x='time', y='co2', template="plotly_dark", height=300)
             fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
             st.plotly_chart(fig, use_container_width=True)
 
         with col_ch4:
-            st.markdown("### 💨 CH4 (ppb)")
+            st.markdown("###  CH4 (ppb) ")
             fig = px.line(df, x='time', y='ch4', template="plotly_dark", height=300)
             fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
             st.plotly_chart(fig, use_container_width=True)
 
         with col_h2o:
-            st.markdown("### 💧 H2O (ppm)")
+            st.markdown("###  H2O (ppm) ")
             fig = px.line(df, x='time', y='h2o', template="plotly_dark", height=300)
             fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
             st.plotly_chart(fig, use_container_width=True)
@@ -132,26 +132,24 @@ def render_live_stream():
     latest = get_latest_leaf_data()
 
     with col_sensors:
-        st.subheader("📝 Live Sensor Readings")
+        st.subheader("Environmental Sensor Readings")
         st.metric("Air Temperature", f"{latest.get('temp_air', 0.0):.1f} °C")
         st.metric("Leaf Temperature", f"{latest.get('temp_leaf', 0.0):.1f} °C")
         st.metric("Humidity", f"{latest.get('humidity', 0.0):.1f} %")
-        st.metric("PAR", f"{latest.get('spectral_total') or 0.0:.2f}")
+        st.metric("PAR", f"{latest.get('par_value', 0.0):.2f} \u00B5mol/m\u00B2/s")
     
     with col_status:
-        st.subheader("⚠️ Cuvette Cycle Status")
+        st.subheader("Cuvette Cycle Status")
         mosfet_state = latest.get("mosfet_state", 0)
         if mosfet_state == 1:
             st.success("✅ **FLUSHING:** Solenoids OPEN")
         else:
             st.warning("🛑 **SEALED:** Solenoids CLOSED")
-        error_box = st.container(border=True)
-        error_box.write("ESP32 Connection: Stable")
 
 def render_dashboard():
     c_title, c_btn = st.columns([4, 1])
-    c_title.title("🌱 Leaf Cuvette Dashboard")
-    c_btn.button("📂 View Full Database", on_click=go_to_data_page)
+    c_title.title("🌱 Chlorophellas Dashboard")
+    c_btn.button("View Full Database", on_click=go_to_data_page)
     render_live_stream()
 
 
@@ -187,12 +185,12 @@ def render_data_view():
     
     if not df.empty:
         df = df.set_index('time')
-        ideal_order = ['co2', 'ch4', 'h2o', 'temp_leaf', 'temp_air', 'humidity', 'spectral_total', 'diag', 'ring_down_time', 'checksum', 'mosfet_state', 'remark']
+        ideal_order = ['co2', 'ch4', 'h2o', 'temp_leaf', 'temp_air', 'humidity', 'par_value', 'diag', 'ring_down_time', 'checksum', 'mosfet_state', 'remark']
         current_cols = [col for col in ideal_order if col in df.columns]
         df = df[current_cols]
         
         # Clean up the column name for the display table and CSV exports
-        df_display = df.rename(columns={'spectral_total': 'par'})
+        df_display = df.rename(columns={'par_value': 'par'})
         
         st.dataframe(df_display, use_container_width=True)
         

@@ -44,10 +44,10 @@ long sumSpecGrn = 0;
 long sumSpecRed = 0;
 unsigned long sumSpecTotal = 0; 
 
-// --- VARIABLES FOR MOSFET TIMING ---
+// --- VARIABLES FOR MOSFET TIMING (Dynamic) ---
 unsigned long previousMosfetTime = 0;
-const long mosfetOnDuration = 780000;  
-const long mosfetOffDuration = 120000; 
+unsigned long mosfetOnDuration = 13 * 60000; // Default 13 mins 
+unsigned long mosfetOffDuration = 2 * 60000; // Default 2 mins
 bool mosfetIsOn = false;
 
 // --- HELPER: THERMISTOR ---
@@ -63,14 +63,31 @@ float getThermistorTemp() {
 
 // --- HELPER: RAW I2C OVERRIDE ---
 void writeSpectralReg(byte reg, byte val) {
-  Wire.beginTransmission(0x39); // AS7343 Address
+  Wire.beginTransmission(0x39);
   Wire.write(reg);
   Wire.write(val);
   Wire.endTransmission();
 }
 
-// --- MQTT CALLBACK ---
-void callback(char* topic, byte* message, unsigned int length) { }
+// --- MQTT CALLBACK (Listens for Streamlit Schedule) ---
+void callback(char* topic, byte* message, unsigned int length) { 
+  String msg;
+  for (int i = 0; i < length; i++) msg += (char)message[i];
+
+  if (String(topic) == "sensors/leaf_1/control") {
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, msg);
+    if (!error) {
+      if (doc.containsKey("open")) {
+        mosfetOnDuration = doc["open"].as<unsigned long>() * 60000;
+      }
+      if (doc.containsKey("closed")) {
+        mosfetOffDuration = doc["closed"].as<unsigned long>() * 60000;
+      }
+      Serial.println("Schedule updated via Streamlit Dashboard!");
+    }
+  }
+}
 
 // --- NETWORK SETUP ---
 void setup_wifi() {
@@ -93,6 +110,8 @@ void reconnect() {
     Serial.print("Attempting MQTT connection...");
     if (client.connect("ESP32LeafClient")) {
       Serial.println("connected");
+      // Subscribe to the control channel upon connecting!
+      client.subscribe("sensors/leaf_1/control");
     } else {
       Serial.print("failed, try again in 5 seconds");
       delay(5000);
@@ -177,11 +196,9 @@ void loop() {
       uint16_t b = mySensor.getBlue();
       uint16_t g = mySensor.getGreen();
       uint16_t r = mySensor.getRed();
-      
       sumSpecBlu += b;
       sumSpecGrn += g;  
       sumSpecRed += r;
-      // Accumulate the raw sum of channels for the PAR calculation
       sumSpecTotal += (b + g + r);
     }
     sampleCount++;
@@ -192,24 +209,24 @@ void loop() {
     lastMsgTime = currentMillis;
 
     if (sampleCount > 0) {
-      // Calculate averages
       float avgRawSpectralSum = (float)sumSpecTotal / sampleCount;
-      
-      // Apply the calibration equation: PAR = 0.2114 * x - 0.3242
       float calibratedPAR = (0.2114 * avgRawSpectralSum) - 0.3242;
-      if (calibratedPAR < 0) calibratedPAR = 0.0; // Prevent negative readings
+      if (calibratedPAR < 0) calibratedPAR = 0.0;
 
       JsonDocument doc;
       doc["sensor"] = "leaf_node_1";
+      // 1. Scalability: Add Cuvette ID
+      doc["cuvette_id"] = 1; 
+      
       doc["temp_air"] = sumShtTemp / sampleCount;
       doc["humidity"] = sumShtHum / sampleCount;
       doc["temp_leaf"] = sumThermTemp / sampleCount;
-      
-      doc["spectral_blu"] = (float)sumSpecBlu / sampleCount;
-      doc["spectral_grn"] = (float)sumSpecGrn / sampleCount;
-      doc["spectral_red"] = (float)sumSpecRed / sampleCount;
       doc["par_value"] = calibratedPAR; 
+      
       doc["mosfet_state"] = mosfetIsOn ? 1 : 0; 
+      // 2. Database Tracking: Log the active schedule schedule
+      doc["mosfet_open_min"] = mosfetOnDuration / 60000;
+      doc["mosfet_closed_min"] = mosfetOffDuration / 60000;
 
       char buffer[512];
       serializeJson(doc, buffer);
@@ -217,7 +234,6 @@ void loop() {
       client.publish("sensors/leaf_1", buffer);
       Serial.println("Published: " + String(buffer));
       
-      // Reset accumulators
       sumShtTemp = 0; sumShtHum = 0; sumThermTemp = 0;
       sumSpecBlu = 0; sumSpecGrn = 0; sumSpecRed = 0; sumSpecTotal = 0;
       sampleCount = 0;

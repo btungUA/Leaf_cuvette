@@ -3,6 +3,8 @@ from influxdb import InfluxDBClient
 import pandas as pd
 import datetime
 import plotly.express as px
+import paho.mqtt.publish as publish
+import json
 
 # --- CONFIGURATION ---
 INFLUX_DB = "sensor_data"
@@ -26,10 +28,8 @@ def get_aggregated_data(start_time=None, end_time=None, limit=1000):
     if not client: return pd.DataFrame()
         
     if start_time and end_time:
-        # 1. Silently convert local time to InfluxDB UTC (+7 hours)
         start_utc = start_time + datetime.timedelta(hours=7)
         end_utc = end_time + datetime.timedelta(hours=7)
-        
         start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
         end_str = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
         time_clause = f"time >= '{start_str}' AND time <= '{end_str}'"
@@ -38,7 +38,6 @@ def get_aggregated_data(start_time=None, end_time=None, limit=1000):
         time_clause = "time > now() - 24h"
         limit_clause = f"LIMIT {limit}"
 
-    # 2. Split the queries to prevent InfluxDB from panicking!
     q_licor = f'''
     SELECT mean("co2") as "co2", mean("ch4") as "ch4", mean("h2o") as "h2o", 
            mean("ring_down_time") as "ring_down_time", max("diag") as "diag", 
@@ -46,15 +45,16 @@ def get_aggregated_data(start_time=None, end_time=None, limit=1000):
     FROM "li7810_sensors" WHERE {time_clause} GROUP BY time(5s) fill(none) ORDER BY time DESC {limit_clause}
     '''
     
+    # ADDED: Fetch cuvette_id and scheduler settings
     q_esp = f'''
     SELECT mean("temp_leaf") as "temp_leaf", mean("temp_air") as "temp_air", 
            mean("humidity") as "humidity", mean("par_value") as "par_value", 
-           last("mosfet_state") as "mosfet_state"
+           last("mosfet_state") as "mosfet_state", last("cuvette_id") as "cuvette_id",
+           last("mosfet_open_min") as "mosfet_open_min", last("mosfet_closed_min") as "mosfet_closed_min"
     FROM "leaf_sensors" WHERE {time_clause} GROUP BY time(5s) fill(none) ORDER BY time DESC {limit_clause}
     '''
 
     try:
-        # Execute independently
         df_licor = pd.DataFrame()
         res_licor = list(client.query(q_licor).get_points())
         if res_licor: df_licor = pd.DataFrame(res_licor)
@@ -63,7 +63,6 @@ def get_aggregated_data(start_time=None, end_time=None, limit=1000):
         res_esp = list(client.query(q_esp).get_points())
         if res_esp: df_esp = pd.DataFrame(res_esp)
 
-        # Merge safely in Python
         if df_licor.empty and df_esp.empty:
             return pd.DataFrame()
         elif df_licor.empty:
@@ -74,12 +73,8 @@ def get_aggregated_data(start_time=None, end_time=None, limit=1000):
             df_final = pd.merge(df_licor, df_esp, on='time', how='outer')
 
         if not df_final.empty:
-            # 3. Parse the time and strictly enforce UTC so Pandas doesn't get confused
             df_final['time'] = pd.to_datetime(df_final['time'], utc=True)
-            
-            # 4. Convert to Arizona time, then strip the timezone wrapper for Streamlit
             df_final['time'] = df_final['time'].dt.tz_convert('America/Phoenix').dt.tz_localize(None)
-            
             df_final = df_final.sort_values('time', ascending=False).reset_index(drop=True)
             
         return df_final
@@ -132,7 +127,7 @@ def render_live_stream():
     latest = get_latest_leaf_data()
 
     with col_sensors:
-        st.subheader("Environmental Sensor Readings")
+        st.subheader(f"Environmental Sensor Readings (Cuvette {int(latest.get('cuvette_id', 1))})")
         st.metric("Air Temperature", f"{latest.get('temp_air', 0.0):.1f} °C")
         st.metric("Leaf Temperature", f"{latest.get('temp_leaf', 0.0):.1f} °C")
         st.metric("Humidity", f"{latest.get('humidity', 0.0):.1f} %")
@@ -150,15 +145,36 @@ def render_dashboard():
     c_title, c_btn = st.columns([4, 1])
     c_title.title("🌱 Chlorophellas Dashboard")
     c_btn.button("View Full Database", on_click=go_to_data_page)
+    
     render_live_stream()
-
+    
+    # --- ADDED: THE MOSFET SCHEDULER UI ---
+    st.divider()
+    st.subheader("⏱️ Cuvette Control Scheduler")
+    st.write("Update the Solenoid/MOSFET timing for Cuvette 1.")
+    
+    sc1, sc2, sc3 = st.columns([1, 1, 2])
+    with sc1:
+        open_min = st.number_input("Open Duration (Minutes)", min_value=1, value=13)
+    with sc2:
+        closed_min = st.number_input("Closed Duration (Minutes)", min_value=1, value=2)
+    with sc3:
+        st.write("") 
+        st.write("") 
+        if st.button("Update Schedule"):
+            # Send the retained MQTT message to the ESP32
+            payload = json.dumps({"open": open_min, "closed": closed_min})
+            try:
+                publish.single("sensors/leaf_1/control", payload, hostname="localhost", retain=True)
+                st.success("Schedule sent successfully! ESP32 will update on its next cycle.")
+            except Exception as e:
+                st.error(f"Failed to send schedule: {e}")
 
 # --- PAGE 2: DATA VIEW ---
 def render_data_view():
     st.title("📂 Database Records")
     st.button("⬅️ Return to Home", on_click=go_to_home)
     
-    # --- TIMEFRAME UI ---
     st.markdown("### 📅 Select Download Range")
     col1, col2, col3, col4 = st.columns(4)
     
@@ -184,12 +200,22 @@ def render_data_view():
         df = get_aggregated_data(limit=1000)
     
     if not df.empty:
+        # ADDED: Calculate Relative Time (Minutes elapsed since the oldest record in this view)
+        min_time = df['time'].min()
+        df.insert(1, 'Time Elapsed (Min)', ((df['time'] - min_time).dt.total_seconds() / 60).round(2))
+        
         df = df.set_index('time')
-        ideal_order = ['co2', 'ch4', 'h2o', 'temp_leaf', 'temp_air', 'humidity', 'par_value', 'diag', 'ring_down_time', 'checksum', 'mosfet_state', 'remark']
+        
+        # ADDED: New variables placed cleanly into the final output
+        ideal_order = [
+            'Time Elapsed (Min)', 'cuvette_id', 'co2', 'ch4', 'h2o', 'temp_leaf', 'temp_air', 
+            'humidity', 'par_value', 'mosfet_state', 'mosfet_open_min', 'mosfet_closed_min',
+            'diag', 'ring_down_time', 'checksum', 'remark'
+        ]
+        
         current_cols = [col for col in ideal_order if col in df.columns]
         df = df[current_cols]
         
-        # Clean up the column name for the display table and CSV exports
         df_display = df.rename(columns={'par_value': 'par'})
         
         st.dataframe(df_display, use_container_width=True)

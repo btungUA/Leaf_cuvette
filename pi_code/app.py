@@ -45,7 +45,6 @@ def get_aggregated_data(start_time=None, end_time=None, limit=1000):
     FROM "li7810_sensors" WHERE {time_clause} GROUP BY time(5s) fill(none) ORDER BY time DESC {limit_clause}
     '''
     
-    # ADDED: Fetch cuvette_id and scheduler settings
     q_esp = f'''
     SELECT mean("temp_leaf") as "temp_leaf", mean("temp_air") as "temp_air", 
            mean("humidity") as "humidity", mean("par_value") as "par_value", 
@@ -98,25 +97,37 @@ def go_to_home(): st.session_state.page = 'dashboard'
 # --- PAGE 1: DASHBOARD ---
 @st.fragment(run_every=2)
 def render_live_stream():
-    df = get_aggregated_data(limit=60) 
+    # Fetch a deep history so the graph and the database share the EXACT same "Time Zero"
+    df = get_aggregated_data(limit=10000) 
+
+    if not df.empty:
+        # 1. Find the true start time of the experiment
+        min_time = df['time'].min()
+        
+        # 2. Calculate the correct elapsed time for every point
+        df['Elapsed Minutes'] = (df['time'] - min_time).dt.total_seconds() / 60.0
+        df = df.sort_values('time', ascending=True)
+        
+        # 3. Slice to show only the last 8 minutes (approx 100 points at 5s intervals) on the live graph
+        df = df.tail(100)
 
     col_co2, col_ch4, col_h2o = st.columns(3)
     if not df.empty and 'co2' in df.columns:
         with col_co2:
             st.markdown("###  CO2 (ppm)")
-            fig = px.line(df, x='time', y='co2', template="plotly_dark", height=300)
+            fig = px.line(df, x='Elapsed Minutes', y='co2', template="plotly_dark", height=300)
             fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
             st.plotly_chart(fig, use_container_width=True)
 
         with col_ch4:
             st.markdown("###  CH4 (ppb) ")
-            fig = px.line(df, x='time', y='ch4', template="plotly_dark", height=300)
+            fig = px.line(df, x='Elapsed Minutes', y='ch4', template="plotly_dark", height=300)
             fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
             st.plotly_chart(fig, use_container_width=True)
 
         with col_h2o:
             st.markdown("###  H2O (ppm) ")
-            fig = px.line(df, x='time', y='h2o', template="plotly_dark", height=300)
+            fig = px.line(df, x='Elapsed Minutes', y='h2o', template="plotly_dark", height=300)
             fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
             st.plotly_chart(fig, use_container_width=True)
     else:
@@ -148,84 +159,106 @@ def render_dashboard():
     
     render_live_stream()
     
-    # --- ADDED: THE MOSFET SCHEDULER UI ---
     st.divider()
     st.subheader("⏱️ Cuvette Control Scheduler")
     st.write("Update the Solenoid/MOSFET timing for Cuvette 1.")
     
     sc1, sc2, sc3 = st.columns([1, 1, 2])
     with sc1:
-        open_min = st.number_input("Open Duration (Minutes)", min_value=1, value=13)
+        # Changed to text input for MM:SS
+        open_val = st.text_input("Open Duration (MM:SS)", value="13:00")
     with sc2:
-        closed_min = st.number_input("Closed Duration (Minutes)", min_value=1, value=2)
+        closed_val = st.text_input("Closed Duration (MM:SS)", value="02:00")
     with sc3:
         st.write("") 
         st.write("") 
         if st.button("Update Schedule"):
-            # Send the retained MQTT message to the ESP32
-            payload = json.dumps({"open": open_min, "closed": closed_min})
             try:
+                # Parse the MM:SS strings into numeric minutes
+                o_m, o_s = map(int, open_val.split(":"))
+                c_m, c_s = map(int, closed_val.split(":"))
+                
+                open_min = o_m + (o_s / 60.0)
+                closed_min = c_m + (c_s / 60.0)
+
+                payload = json.dumps({"open": open_min, "closed": closed_min})
                 publish.single("sensors/leaf_1/control", payload, hostname="localhost", retain=True)
                 st.success("Schedule sent successfully! ESP32 will update on its next cycle.")
+            except ValueError:
+                st.error("Please use MM:SS format (e.g., 13:00)")
             except Exception as e:
                 st.error(f"Failed to send schedule: {e}")
 
+# --- PAGE 2: DATA VIEW ---
 # --- PAGE 2: DATA VIEW ---
 def render_data_view():
     st.title("📂 Database Records")
     st.button("⬅️ Return to Home", on_click=go_to_home)
     
-    st.markdown("### 📅 Select Download Range")
-    col1, col2, col3, col4 = st.columns(4)
+    st.markdown("### ⏳ Select Download Range by Elapsed Time")
     
-    now = datetime.datetime.now()
-    one_hour_ago = now - datetime.timedelta(hours=1)
+    use_custom = st.checkbox("Apply Elapsed Time Filter (Uncheck to view all records)")
     
-    with col1: start_date = st.date_input("Start Date", one_hour_ago.date())
-    with col2: start_time = st.time_input("Start Time", one_hour_ago.time())
-    with col3: end_date = st.date_input("End Date", now.date())
-    with col4: end_time = st.time_input("End Time", now.time())
+    col1, col2 = st.columns(2)
+    with col1:
+        start_val = st.text_input("Start Elapsed Time (MM:SS)", value="00:00")
+    with col2:
+        end_val = st.text_input("End Elapsed Time (MM:SS)", value="60:00")
         
-    start_dt = datetime.datetime.combine(start_date, start_time)
-    end_dt = datetime.datetime.combine(end_date, end_time)
-    
-    use_custom = st.checkbox("Apply Date/Time Filter (Uncheck to view latest 1000 records)")
     st.divider()
     
-    if use_custom:
-        df = get_aggregated_data(start_time=start_dt, end_time=end_dt)
-        if not df.empty:
-            st.success(f"Loaded records between {start_dt.strftime('%H:%M')} and {end_dt.strftime('%H:%M')}")
-    else:
-        df = get_aggregated_data(limit=1000)
+    # Fetch a massive block of data to guarantee a solid "Time Zero"
+    df = get_aggregated_data(limit=10000) 
     
     if not df.empty:
-        # ADDED: Calculate Relative Time (Minutes elapsed since the oldest record in this view)
-        min_time = df['time'].min()
-        df.insert(1, 'Time Elapsed (Min)', ((df['time'] - min_time).dt.total_seconds() / 60).round(2))
-        
-        df = df.set_index('time')
-        
-        # ADDED: New variables placed cleanly into the final output
-        ideal_order = [
-            'Time Elapsed (Min)', 'cuvette_id', 'co2', 'ch4', 'h2o', 'temp_leaf', 'temp_air', 
-            'humidity', 'par_value', 'mosfet_state', 'mosfet_open_min', 'mosfet_closed_min',
-            'diag', 'ring_down_time', 'checksum', 'remark'
-        ]
-        
-        current_cols = [col for col in ideal_order if col in df.columns]
-        df = df[current_cols]
-        
-        df_display = df.rename(columns={'par_value': 'par'})
-        
-        st.dataframe(df_display, use_container_width=True)
-        
-        c1, c2 = st.columns(2)
-        csv_data = df_display.reset_index().to_csv(index=False).encode('utf-8')
-        json_data = df_display.reset_index().to_json(orient='records')
-        
-        c1.download_button("Download CSV", data=csv_data, file_name='leaf_data.csv', mime='text/csv')
-        c2.download_button("Download JSON", data=json_data, file_name='leaf_data.json', mime='application/json')
+        try:
+            min_time = df['time'].min()
+            df['total_sec'] = (df['time'] - min_time).dt.total_seconds()
+            
+            if use_custom:
+                s_m, s_s = map(int, start_val.split(":"))
+                e_m, e_s = map(int, end_val.split(":"))
+                start_sec = s_m * 60 + s_s
+                end_sec = e_m * 60 + e_s
+                
+                # Apply the filter only if the checkbox is checked
+                df = df[(df['total_sec'] >= start_sec) & (df['total_sec'] <= end_sec)]
+                
+                if df.empty:
+                    st.warning("No data found in that specific time range.")
+                    return
+                st.success(f"Filtered records between {start_val} and {end_val}.")
+            else:
+                st.success("Showing all available records.")
+            
+            # Format back to clean MM:SS strings for the table view
+            df['Elapsed Time'] = df['total_sec'].apply(lambda x: f"{int(x // 60):02d}:{int(x % 60):02d}")
+            df = df.drop(columns=['time', 'total_sec'])
+            
+            # Map 1 and 0 to Open and Closed
+            if 'mosfet_state' in df.columns:
+                df['mosfet_state'] = df['mosfet_state'].apply(
+                    lambda x: 'Open' if pd.notna(x) and int(x) == 1 else ('Closed' if pd.notna(x) else x)
+                )
+            
+            ideal_order = [
+                'Elapsed Time', 'cuvette_id', 'co2', 'ch4', 'h2o', 'temp_leaf', 'temp_air', 
+                'humidity', 'par_value', 'mosfet_state', 'mosfet_open_min', 'mosfet_closed_min',
+                'diag', 'ring_down_time', 'checksum', 'remark'
+            ]
+            
+            current_cols = [col for col in ideal_order if col in df.columns]
+            df = df[current_cols]
+            df_display = df.rename(columns={'par_value': 'par'})
+            
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
+            
+            c1, c2 = st.columns(2)
+            c1.download_button("Download CSV", data=df_display.to_csv(index=False).encode('utf-8'), file_name='leaf_data.csv', mime='text/csv')
+            c2.download_button("Download JSON", data=df_display.to_json(orient='records'), file_name='leaf_data.json', mime='application/json')
+            
+        except ValueError:
+            st.error("Please use valid MM:SS format (e.g., 20:00)")
     else:
         st.info("No data found in database. Check connections.")
 

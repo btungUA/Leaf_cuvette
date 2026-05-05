@@ -12,10 +12,10 @@ const char* WIFI_PASS = "cuvettemaster";
 const char* MQTT_SERVER = "10.42.0.1";
 const int MQTT_PORT = 1883;
 
-// --- PIN DEFINITIONS ---
-#define SDA_PIN 1
-#define SCL_PIN 2
-#define THERMISTOR_PIN 4      
+// --- PIN DEFINITIONS (Forced Custom PCB Routing) ---
+#define SDA_PIN 21    // Hardware TX0
+#define SCL_PIN 22
+#define THERMISTOR_PIN 34  
 #define MOSFET_PIN 13
 
 // --- OBJECT INSTANTIATION ---
@@ -28,7 +28,7 @@ SfeAS7343ArdI2C mySensor;
 const float VCC = 3.30;
 const float SERIES_R = 10000.0;
 const float R0 = 10000.0;
-const float T0 = 25.0 + 273.15;
+const float NOMINAL_TEMP = 25.0 + 273.15; 
 const float BETA = 3950.0;
 
 // --- VARIABLES FOR MULTITASKING & AVERAGING ---
@@ -46,8 +46,8 @@ unsigned long sumSpecTotal = 0;
 
 // --- VARIABLES FOR MOSFET TIMING (Dynamic) ---
 unsigned long previousMosfetTime = 0;
-unsigned long mosfetOnDuration = 13 * 60000; // Default 13 mins 
-unsigned long mosfetOffDuration = 2 * 60000; // Default 2 mins
+unsigned long mosfetOnDuration = 13 * 60000; 
+unsigned long mosfetOffDuration = 2 * 60000; 
 bool mosfetIsOn = false;
 
 // --- HELPER: THERMISTOR ---
@@ -55,9 +55,10 @@ float getThermistorTemp() {
   int adcVal = analogRead(THERMISTOR_PIN);
   if (adcVal <= 0) return 0.0;
   float voltage = adcVal * (VCC / 4095.0);
-  float Rtherm = (SERIES_R * (VCC / voltage - 1.0));
-  float steinhart = log(Rtherm / R0) / BETA + 1.0 / T0;
+  float Rtherm = (SERIES_R / ((VCC / voltage - 1.0)));
+  float steinhart = log(Rtherm / R0) / BETA + 1.0 / NOMINAL_TEMP;
   float tempC = (1.0 / steinhart) - 273.15;
+  //return tempC;
   return (((tempC - 32.21) * 30.4) / 14.29) + 1.9;
 }
 
@@ -69,7 +70,36 @@ void writeSpectralReg(byte reg, byte val) {
   Wire.endTransmission();
 }
 
-// --- MQTT CALLBACK (Listens for Streamlit Schedule) ---
+// --- HELPER: I2C BUS RECOVERY FOR TX0 PIN ---
+void clearI2CBus() {
+  // 1. Explicitly kill the Serial port so it releases Pin 1
+  Serial.end(); 
+  
+  // 2. Take manual GPIO control of the pins
+  pinMode(SDA_PIN, INPUT_PULLUP);
+  pinMode(SCL_PIN, INPUT_PULLUP);
+  delay(200); // Wait for the boot ROM garbage to completely finish
+
+  // 3. Generate 16 manual clock pulses to free any stuck sensors
+  pinMode(SCL_PIN, OUTPUT);
+  for (int i = 0; i < 16; i++) {
+    digitalWrite(SCL_PIN, LOW);
+    delayMicroseconds(20);
+    digitalWrite(SCL_PIN, HIGH);
+    delayMicroseconds(20);
+  }
+
+  // 4. Force a clean I2C STOP condition
+  pinMode(SDA_PIN, OUTPUT);
+  digitalWrite(SDA_PIN, LOW);
+  delayMicroseconds(20);
+  digitalWrite(SCL_PIN, HIGH); 
+  delayMicroseconds(20);
+  digitalWrite(SDA_PIN, HIGH); 
+  delay(100);
+}
+
+// --- MQTT CALLBACK ---
 void callback(char* topic, byte* message, unsigned int length) { 
   String msg;
   for (int i = 0; i < length; i++) msg += (char)message[i];
@@ -78,13 +108,12 @@ void callback(char* topic, byte* message, unsigned int length) {
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, msg);
     if (!error) {
-      if (doc.containsKey("open")) {
+      if (doc["open"].is<unsigned long>()) {
         mosfetOnDuration = doc["open"].as<unsigned long>() * 60000;
       }
-      if (doc.containsKey("closed")) {
+      if (doc["closed"].is<unsigned long>()) {
         mosfetOffDuration = doc["closed"].as<unsigned long>() * 60000;
       }
-      Serial.println("Schedule updated via Streamlit Dashboard!");
     }
   }
 }
@@ -92,28 +121,18 @@ void callback(char* topic, byte* message, unsigned int length) {
 // --- NETWORK SETUP ---
 void setup_wifi() {
   delay(10);
-  Serial.print("\nConnecting to WiFi: "); 
-  Serial.println(WIFI_SSID);
-  
   WiFi.mode(WIFI_STA); 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.print(".");
   }
-  Serial.println("\nWiFi connected! IP: " + WiFi.localIP().toString());
 }
 
 void reconnect() {
   while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
     if (client.connect("ESP32LeafClient")) {
-      Serial.println("connected");
-      // Subscribe to the control channel upon connecting!
       client.subscribe("sensors/leaf_1/control");
     } else {
-      Serial.print("failed, try again in 5 seconds");
       delay(5000);
     }
   }
@@ -121,34 +140,40 @@ void reconnect() {
 
 // --- MAIN SETUP ---
 void setup() {
-  Serial.begin(115200);
-  
-  unsigned long waitStart = millis();
-  while (!Serial && millis() - waitStart < 5000) {
-    delay(10);
-  }
-  
-  Serial.println("\n\n--- ESP32 AWAKE ---");
-  
+  // 1. Recover the deadlocked bus BEFORE starting the Wire library!
+  // Notice there is NO Serial.begin() anywhere!
+  clearI2CBus();
+
+  // 2. Initialize the bus safely on the custom pins
   Wire.begin(SDA_PIN, SCL_PIN);
-  pinMode(THERMISTOR_PIN, INPUT);
+
+  // 3. Force Soft Resets to wipe out any lingering state logic
+  Wire.beginTransmission(0x44); 
+  Wire.write(0x30);
+  Wire.write(0xA2);
+  Wire.endTransmission();
   
+  Wire.beginTransmission(0x39); 
+  Wire.write(0x80);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  delay(100); 
+
+  // --- Normal Initialization ---
+  pinMode(THERMISTOR_PIN, INPUT);
   pinMode(MOSFET_PIN, OUTPUT);
-  digitalWrite(MOSFET_PIN, HIGH);
-  mosfetIsOn = true;
+  digitalWrite(MOSFET_PIN, LOW);
+  mosfetIsOn = false;
   previousMosfetTime = millis();
 
   sht31.begin(0x44); 
 
-  if (!mySensor.begin(0x39, Wire)) {
-    Serial.println("AS7343 failed!");
-  } else {
+  if (mySensor.begin(0x39, Wire)) {
     mySensor.powerOn();
     writeSpectralReg(0xC6, 0x02); 
     writeSpectralReg(0x81, 0x1D); 
     writeSpectralReg(0xD4, 0xE7); 
     writeSpectralReg(0xD5, 0x03); 
-
     mySensor.setAutoSmux(AUTOSMUX_18_CHANNELS); 
     mySensor.enableSpectralMeasurement();
   }
@@ -215,7 +240,6 @@ void loop() {
 
       JsonDocument doc;
       doc["sensor"] = "leaf_node_1";
-      // 1. Scalability: Add Cuvette ID
       doc["cuvette_id"] = 1; 
       
       doc["temp_air"] = sumShtTemp / sampleCount;
@@ -224,7 +248,6 @@ void loop() {
       doc["par_value"] = calibratedPAR; 
       
       doc["mosfet_state"] = mosfetIsOn ? 1 : 0; 
-      // 2. Database Tracking: Log the active schedule schedule
       doc["mosfet_open_min"] = mosfetOnDuration / 60000;
       doc["mosfet_closed_min"] = mosfetOffDuration / 60000;
 
@@ -232,7 +255,6 @@ void loop() {
       serializeJson(doc, buffer);
       
       client.publish("sensors/leaf_1", buffer);
-      Serial.println("Published: " + String(buffer));
       
       sumShtTemp = 0; sumShtHum = 0; sumThermTemp = 0;
       sumSpecBlu = 0; sumSpecGrn = 0; sumSpecRed = 0; sumSpecTotal = 0;

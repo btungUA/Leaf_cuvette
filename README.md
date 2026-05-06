@@ -1,2 +1,1 @@
-# Leaf Cuvette Project
 
